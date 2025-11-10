@@ -172,6 +172,16 @@ RC MvccTrx::delete_record(Table *table, Record &record)
   return RC::SUCCESS;
 }
 
+RC MvccTrx::update_record(Table *table, Record &old_record, Record &new_record)
+{
+  RC rc = table->update_record_with_trx(old_record, new_record, this);
+  if (OB_FAIL(rc)) {
+    LOG_WARN("failed to update record in mvcc trx. table=%s, rid=%s, rc=%s",
+        table->name(), old_record.rid().to_string().c_str(), strrc(rc));
+  }
+  return rc;
+}
+
 RC MvccTrx::visit_record(Table *table, Record &record, ReadWriteMode mode)
 {
   Field begin_field;
