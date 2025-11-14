@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "sql/expr/expression.h"
 #include "sql/operator/operator_node.h"
 #include "common/lang/unordered_set.h"
+#include "sql/parser/yacc_sql.hpp"
 
 /**
  * @brief 逻辑算子
@@ -38,6 +39,7 @@ enum class LogicalOperatorType
   JOIN,        ///< 连接
   INSERT,      ///< 插入
   DELETE,      ///< 删除，删除可能会有子查询
+  UPDATE,     ///< 更新，更新可能会有子查询
   EXPLAIN,     ///< 查看执行计划
   GROUP_BY,    ///< 分组
 };

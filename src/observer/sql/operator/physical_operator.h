@@ -17,6 +17,7 @@ See the Mulan PSL v2 for more details. */
 #include "common/sys/rc.h"
 #include "sql/expr/tuple.h"
 #include "sql/operator/operator_node.h"
+#include "sql/parser/yacc_sql.hpp"
 
 class Record;
 class TupleCellSpec;
@@ -48,6 +49,7 @@ enum class PhysicalOperatorType
   STRING_LIST,
   DELETE,
   INSERT,
+  UPDATE,
   SCALAR_GROUP_BY,
   HASH_GROUP_BY,
   GROUP_BY_VEC,

@@ -103,6 +103,66 @@ RC HeapTableEngine::delete_record(const Record &record)
   return rc;
 }
 
+RC HeapTableEngine::update_record_with_trx(const Record &old_record, const Record &new_record, Trx *trx)
+{
+  (void)trx;
+
+  const RID &rid = old_record.rid();
+
+  RC rc = delete_entry_of_indexes(old_record.data(), rid, true /*error_on_not_exists*/);
+  if (OB_FAIL(rc)) {
+    LOG_WARN("failed to delete old index entries while updating record. table=%s, rid=%s, rc=%s",
+        table_meta_->name(), rid.to_string().c_str(), strrc(rc));
+    return rc;
+  }
+
+  RC visit_result = RC::SUCCESS;
+  rc = record_handler_->visit_record(rid, [this, &new_record, &visit_result](Record &inplace_record) -> bool {
+    if (inplace_record.len() != new_record.len()) {
+      visit_result = RC::INTERNAL;
+      LOG_WARN("record length mismatch when updating. inplace len=%d, new len=%d",
+          inplace_record.len(), new_record.len());
+      return false;
+    }
+    memcpy(inplace_record.data(), new_record.data(), table_meta_->record_size());
+    visit_result = RC::SUCCESS;
+    return true;
+  });
+
+  if (OB_FAIL(rc) || OB_FAIL(visit_result)) {
+    RC restore_rc = insert_entry_of_indexes(old_record.data(), rid);
+    if (OB_FAIL(restore_rc)) {
+      LOG_PANIC("failed to restore index entries when update record visit failed. table=%s, rid=%s, rc=%s",
+          table_meta_->name(), rid.to_string().c_str(), strrc(restore_rc));
+    }
+    return OB_FAIL(rc) ? rc : visit_result;
+  }
+
+  rc = insert_entry_of_indexes(new_record.data(), rid);
+  if (OB_FAIL(rc)) {
+    LOG_WARN("failed to insert new index entries while updating record. table=%s, rid=%s, rc=%s",
+        table_meta_->name(), rid.to_string().c_str(), strrc(rc));
+
+    RC rollback_rc = record_handler_->visit_record(rid, [this, &old_record](Record &inplace_record) -> bool {
+      memcpy(inplace_record.data(), old_record.data(), table_meta_->record_size());
+      return true;
+    });
+    if (OB_FAIL(rollback_rc)) {
+      LOG_PANIC("failed to rollback record data after index update failure. table=%s, rid=%s, rc=%s",
+          table_meta_->name(), rid.to_string().c_str(), strrc(rollback_rc));
+    }
+
+    rollback_rc = insert_entry_of_indexes(old_record.data(), rid);
+    if (OB_FAIL(rollback_rc)) {
+      LOG_PANIC("failed to rollback index entries after update failure. table=%s, rid=%s, rc=%s",
+          table_meta_->name(), rid.to_string().c_str(), strrc(rollback_rc));
+    }
+    return rc;
+  }
+
+  return RC::SUCCESS;
+}
+
 RC HeapTableEngine::get_record_scanner(RecordScanner *&scanner, Trx *trx, ReadWriteMode mode)
 {
   scanner = new HeapRecordScanner(table_, *data_buffer_pool_, trx, db_->log_handler(), mode, nullptr);

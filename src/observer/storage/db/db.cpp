@@ -21,6 +21,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/log/log.h"
 #include "common/os/path.h"
 #include "common/global_context.h"
+#include "common/lang/filesystem.h"
+#include "common/lang/system_error.h"
 #include "storage/common/meta_util.h"
 #include "storage/table/table.h"
 #include "storage/table/table_meta.h"
@@ -174,6 +176,85 @@ RC Db::create_table(const char *table_name, span<const AttrInfoSqlNode> attribut
   opened_tables_[table_name] = table;
   LOG_INFO("Create table success. table name=%s, table_id:%d", table_name, table_id);
   return RC::SUCCESS;
+}
+
+RC Db::drop_table(const char *table_name)
+{
+  if (common::is_blank(table_name)) {
+    LOG_WARN("invalid table name when dropping table");
+    return RC::INVALID_ARGUMENT;
+  }
+
+  auto iter = opened_tables_.find(table_name);
+  if (iter == opened_tables_.end()) {
+    LOG_WARN("table not exist: %s", table_name);
+    return RC::SCHEMA_TABLE_NOT_EXIST;
+  }
+
+  Table *table = iter->second;
+  const TableMeta &table_meta = table->table_meta();
+
+  vector<string> index_files;
+  index_files.reserve(table_meta.index_num());
+  for (int i = 0; i < table_meta.index_num(); i++) {
+    const IndexMeta *index_meta = table_meta.index(i);
+    if (index_meta != nullptr) {
+      index_files.emplace_back(table_index_file(path_.c_str(), table_meta.name(), index_meta->name()));
+    }
+  }
+
+  string data_file = table_data_file(path_.c_str(), table_meta.name());
+  string meta_file = table_meta_file(path_.c_str(), table_meta.name());
+  string lob_file  = table_lob_file(path_.c_str(), table_meta.name());
+
+  opened_tables_.erase(iter);
+
+  auto remove_file = [](const string &file_name) -> RC {
+    if (file_name.empty()) {
+      return RC::SUCCESS;
+    }
+
+    std::error_code ec;
+    if (!filesystem::remove(file_name, ec)) {
+      if (ec) {
+        LOG_WARN("failed to remove file: %s, error=%s", file_name.c_str(), ec.message().c_str());
+        return RC::FILE_REMOVE;
+      }
+    }
+    return RC::SUCCESS;
+  };
+
+  delete table;
+
+  RC rc = RC::SUCCESS;
+
+  for (const string &index_file : index_files) {
+    RC tmp_rc = remove_file(index_file);
+    if (OB_FAIL(tmp_rc) && OB_SUCC(rc)) {
+      rc = tmp_rc;
+    }
+  }
+
+  RC tmp_rc = remove_file(data_file);
+  if (OB_FAIL(tmp_rc) && OB_SUCC(rc)) {
+    rc = tmp_rc;
+  }
+
+  tmp_rc = remove_file(lob_file);
+  if (OB_FAIL(tmp_rc) && OB_SUCC(rc)) {
+    rc = tmp_rc;
+  }
+
+  tmp_rc = remove_file(meta_file);
+  if (OB_FAIL(tmp_rc) && OB_SUCC(rc)) {
+    rc = tmp_rc;
+  }
+
+  if (OB_SUCC(rc)) {
+    LOG_INFO("drop table success. table name=%s", table_name);
+  }
+
+  return rc;
 }
 
 Table *Db::find_table(const char *table_name) const

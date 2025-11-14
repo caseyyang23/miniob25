@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details. */
 #include "sql/operator/delete_logical_operator.h"
 #include "sql/operator/explain_logical_operator.h"
 #include "sql/operator/insert_logical_operator.h"
+#include "sql/operator/update_logical_operator.h"
 #include "sql/operator/join_logical_operator.h"
 #include "sql/operator/logical_operator.h"
 #include "sql/operator/predicate_logical_operator.h"
@@ -32,6 +33,7 @@ See the Mulan PSL v2 for more details. */
 #include "sql/stmt/explain_stmt.h"
 #include "sql/stmt/filter_stmt.h"
 #include "sql/stmt/insert_stmt.h"
+#include "sql/stmt/update_stmt.h"
 #include "sql/stmt/select_stmt.h"
 #include "sql/stmt/stmt.h"
 
@@ -66,6 +68,12 @@ RC LogicalPlanGenerator::create(Stmt *stmt, unique_ptr<LogicalOperator> &logical
       DeleteStmt *delete_stmt = static_cast<DeleteStmt *>(stmt);
 
       rc = create_plan(delete_stmt, logical_operator);
+    } break;
+
+    case StmtType::UPDATE: {
+      UpdateStmt *update_stmt = static_cast<UpdateStmt *>(stmt);
+
+      rc = create_plan(update_stmt, logical_operator);
     } break;
 
     case StmtType::EXPLAIN: {
@@ -154,24 +162,26 @@ RC LogicalPlanGenerator::create_plan(FilterStmt *filter_stmt, unique_ptr<Logical
   RC                                  rc = RC::SUCCESS;
   vector<unique_ptr<Expression>> cmp_exprs;
   const vector<FilterUnit *>    &filter_units = filter_stmt->filter_units();
-  for (const FilterUnit *filter_unit : filter_units) {
-    const FilterObj &filter_obj_left  = filter_unit->left();
-    const FilterObj &filter_obj_right = filter_unit->right();
+  for (FilterUnit *filter_unit : filter_units) {
+    unique_ptr<ComparisonExpr> comparison_expr = filter_unit->take_comparison_expr();
+    if (comparison_expr == nullptr) {
+      LOG_WARN("null comparison expression in filter unit");
+      return RC::INVALID_ARGUMENT;
+    }
 
-    unique_ptr<Expression> left(filter_obj_left.is_attr
-                                    ? static_cast<Expression *>(new FieldExpr(filter_obj_left.field))
-                                    : static_cast<Expression *>(new ValueExpr(filter_obj_left.value)));
+    unique_ptr<Expression> &left  = comparison_expr->left();
+    unique_ptr<Expression> &right = comparison_expr->right();
 
-    unique_ptr<Expression> right(filter_obj_right.is_attr
-                                     ? static_cast<Expression *>(new FieldExpr(filter_obj_right.field))
-                                     : static_cast<Expression *>(new ValueExpr(filter_obj_right.value)));
-
+    if (left == nullptr || right == nullptr) {
+      LOG_WARN("incomplete comparison expression");
+      return RC::INVALID_ARGUMENT;
+    }
     if (left->value_type() != right->value_type()) {
       auto left_to_right_cost = implicit_cast_cost(left->value_type(), right->value_type());
       auto right_to_left_cost = implicit_cast_cost(right->value_type(), left->value_type());
       if (left_to_right_cost <= right_to_left_cost && left_to_right_cost != INT32_MAX) {
         ExprType left_type = left->type();
-        auto cast_expr = make_unique<CastExpr>(std::move(left), right->value_type());
+        auto cast_expr     = make_unique<CastExpr>(std::move(left), right->value_type());
         if (left_type == ExprType::VALUE) {
           Value left_val;
           if (OB_FAIL(rc = cast_expr->try_get_value(left_val)))
@@ -185,7 +195,7 @@ RC LogicalPlanGenerator::create_plan(FilterStmt *filter_stmt, unique_ptr<Logical
         }
       } else if (right_to_left_cost < left_to_right_cost && right_to_left_cost != INT32_MAX) {
         ExprType right_type = right->type();
-        auto cast_expr = make_unique<CastExpr>(std::move(right), left->value_type());
+        auto cast_expr      = make_unique<CastExpr>(std::move(right), left->value_type());
         if (right_type == ExprType::VALUE) {
           Value right_val;
           if (OB_FAIL(rc = cast_expr->try_get_value(right_val)))
@@ -205,8 +215,7 @@ RC LogicalPlanGenerator::create_plan(FilterStmt *filter_stmt, unique_ptr<Logical
       }
     }
 
-    ComparisonExpr *cmp_expr = new ComparisonExpr(filter_unit->comp(), std::move(left), std::move(right));
-    cmp_exprs.emplace_back(cmp_expr);
+    cmp_exprs.emplace_back(std::move(comparison_expr));
   }
 
   unique_ptr<PredicateLogicalOperator> predicate_oper;
@@ -261,6 +270,36 @@ RC LogicalPlanGenerator::create_plan(DeleteStmt *delete_stmt, unique_ptr<Logical
 
   logical_operator = std::move(delete_oper);
   return rc;
+}
+
+RC LogicalPlanGenerator::create_plan(UpdateStmt *update_stmt, unique_ptr<LogicalOperator> &logical_operator)
+{
+  Table                      *table       = update_stmt->table();
+  FilterStmt                 *filter_stmt = update_stmt->filter_stmt();
+  unique_ptr<LogicalOperator> table_get_oper(new TableGetLogicalOperator(table, ReadWriteMode::READ_WRITE));
+
+  unique_ptr<LogicalOperator> predicate_oper;
+
+  RC rc = create_plan(filter_stmt, predicate_oper);
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
+
+  std::vector<const FieldMeta *> fields(update_stmt->update_fields().begin(), update_stmt->update_fields().end());
+  std::vector<Value>             values(update_stmt->update_values().begin(), update_stmt->update_values().end());
+
+  unique_ptr<LogicalOperator> update_oper(
+      new UpdateLogicalOperator(table, std::move(fields), std::move(values)));
+
+  if (predicate_oper) {
+    predicate_oper->add_child(std::move(table_get_oper));
+    update_oper->add_child(std::move(predicate_oper));
+  } else {
+    update_oper->add_child(std::move(table_get_oper));
+  }
+
+  logical_operator = std::move(update_oper);
+  return RC::SUCCESS;
 }
 
 RC LogicalPlanGenerator::create_plan(ExplainStmt *explain_stmt, unique_ptr<LogicalOperator> &logical_operator)

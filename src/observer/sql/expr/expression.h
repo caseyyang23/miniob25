@@ -429,7 +429,8 @@ private:
   RC calc_value(const Value &left_value, const Value &right_value, Value &value) const;
 
   RC calc_column(const Column &left_column, const Column &right_column, Column &column) const;
-
+  RC calc_unary_column(const Column &left_column, Column &column) const;
+  
   template <bool LEFT_CONSTANT, bool RIGHT_CONSTANT>
   RC execute_calc(const Column &left, const Column &right, Column &result, Type type, AttrType attr_type) const;
 
