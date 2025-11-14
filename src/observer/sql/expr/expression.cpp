@@ -464,17 +464,23 @@ RC ArithmeticExpr::get_value(const Tuple &tuple, Value &value) const
   RC rc = RC::SUCCESS;
 
   Value left_value;
-  Value right_value;
 
   rc = left_->get_value(tuple, left_value);
   if (rc != RC::SUCCESS) {
     LOG_WARN("failed to get value of left expression. rc=%s", strrc(rc));
     return rc;
   }
-  rc = right_->get_value(tuple, right_value);
-  if (rc != RC::SUCCESS) {
-    LOG_WARN("failed to get value of right expression. rc=%s", strrc(rc));
-    return rc;
+  Value right_value;
+  if (arithmetic_type_ != Type::NEGATIVE) {
+    if (right_ == nullptr) {
+      LOG_WARN("binary arithmetic expression missing right child");
+      return RC::INTERNAL;
+    }
+    rc = right_->get_value(tuple, right_value);
+    if (rc != RC::SUCCESS) {
+      LOG_WARN("failed to get value of right expression. rc=%s", strrc(rc));
+      return rc;
+    }
   }
   return calc_value(left_value, right_value, value);
 }
@@ -487,13 +493,17 @@ RC ArithmeticExpr::get_column(Chunk &chunk, Column &column)
     return rc;
   }
   Column left_column;
-  Column right_column;
 
   rc = left_->get_column(chunk, left_column);
   if (rc != RC::SUCCESS) {
     LOG_WARN("failed to get column of left expression. rc=%s", strrc(rc));
     return rc;
   }
+    if (arithmetic_type_ == Type::NEGATIVE || right_ == nullptr) {
+    return calc_unary_column(left_column, column);
+  }
+
+  Column right_column;
   rc = right_->get_column(chunk, right_column);
   if (rc != RC::SUCCESS) {
     LOG_WARN("failed to get column of right expression. rc=%s", strrc(rc));
@@ -504,6 +514,10 @@ RC ArithmeticExpr::get_column(Chunk &chunk, Column &column)
 
 RC ArithmeticExpr::calc_column(const Column &left_column, const Column &right_column, Column &column) const
 {
+  if (arithmetic_type_ == Type::NEGATIVE || right_ == nullptr) {
+    LOG_WARN("unary arithmetic expression should not call binary calc_column");
+    return RC::INTERNAL;
+  }
   RC rc = RC::SUCCESS;
 
   const AttrType target_type = value_type();
@@ -522,6 +536,27 @@ RC ArithmeticExpr::calc_column(const Column &left_column, const Column &right_co
   } else {
     column.set_column_type(Column::Type::NORMAL_COLUMN);
     rc = execute_calc<false, false>(left_column, right_column, column, arithmetic_type_, target_type);
+  }
+  return rc;
+}
+
+RC ArithmeticExpr::calc_unary_column(const Column &left_column, Column &column) const
+{
+  if (arithmetic_type_ != Type::NEGATIVE) {
+    LOG_WARN("unsupported unary arithmetic type");
+    return RC::INTERNAL;
+  }
+  RC rc = RC::SUCCESS;
+
+  const AttrType target_type = value_type();
+  column.init(target_type, left_column.attr_len(), left_column.count());
+  bool left_const = left_column.column_type() == Column::Type::CONSTANT_COLUMN;
+  column.set_column_type(left_const ? Column::Type::CONSTANT_COLUMN : Column::Type::NORMAL_COLUMN);
+
+  if (left_const) {
+    rc = execute_calc<true, true>(left_column, left_column, column, arithmetic_type_, target_type);
+  } else {
+    rc = execute_calc<false, true>(left_column, left_column, column, arithmetic_type_, target_type);
   }
   return rc;
 }

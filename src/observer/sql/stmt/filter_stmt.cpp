@@ -16,8 +16,18 @@ See the Mulan PSL v2 for more details. */
 #include "common/lang/string.h"
 #include "common/log/log.h"
 #include "common/sys/rc.h"
+#include "sql/parser/expression_binder.h"
 #include "storage/db/db.h"
 #include "storage/table/table.h"
+
+void FilterUnit::set_comparison(unique_ptr<ComparisonExpr> comparison_expr)
+{
+  comparison_expr_ = std::move(comparison_expr);
+  Expression *left  = comparison_expr_ ? comparison_expr_->left().get() : nullptr;
+  Expression *right = comparison_expr_ ? comparison_expr_->right().get() : nullptr;
+  left_.init_expression(left);
+  right_.init_expression(right);
+}
 
 FilterStmt::~FilterStmt()
 {
@@ -34,10 +44,28 @@ RC FilterStmt::create(Db *db, Table *default_table, unordered_map<string, Table 
   stmt  = nullptr;
 
   FilterStmt *tmp_stmt = new FilterStmt();
+
+  if (condition_num > 0 && conditions == nullptr) {
+    LOG_WARN("invalid argument: conditions is null while condition_num=%d", condition_num);
+    delete tmp_stmt;
+    return RC::INVALID_ARGUMENT;
+  }
+
+  BinderContext binder_context;
+  if (tables != nullptr) {
+    for (const auto &entry : *tables) {
+      binder_context.add_table(entry.second);
+    }
+  } else if (default_table != nullptr) {
+    binder_context.add_table(default_table);
+  }
+
+  ExpressionBinder expression_binder(binder_context);
+
   for (int i = 0; i < condition_num; i++) {
     FilterUnit *filter_unit = nullptr;
 
-    rc = create_filter_unit(db, default_table, tables, conditions[i], filter_unit);
+    rc = create_filter_unit(db, default_table, tables, conditions[i], expression_binder, filter_unit);
     if (rc != RC::SUCCESS) {
       delete tmp_stmt;
       LOG_WARN("failed to create filter unit. condition index=%d", i);
@@ -50,38 +78,14 @@ RC FilterStmt::create(Db *db, Table *default_table, unordered_map<string, Table 
   return rc;
 }
 
-RC get_table_and_field(Db *db, Table *default_table, unordered_map<string, Table *> *tables,
-    const RelAttrSqlNode &attr, Table *&table, const FieldMeta *&field)
-{
-  if (common::is_blank(attr.relation_name.c_str())) {
-    table = default_table;
-  } else if (nullptr != tables) {
-    auto iter = tables->find(attr.relation_name);
-    if (iter != tables->end()) {
-      table = iter->second;
-    }
-  } else {
-    table = db->find_table(attr.relation_name.c_str());
-  }
-  if (nullptr == table) {
-    LOG_WARN("No such table: attr.relation_name: %s", attr.relation_name.c_str());
-    return RC::SCHEMA_TABLE_NOT_EXIST;
-  }
-
-  field = table->table_meta().field(attr.attribute_name.c_str());
-  if (nullptr == field) {
-    LOG_WARN("no such field in table: table %s, field %s", table->name(), attr.attribute_name.c_str());
-    table = nullptr;
-    return RC::SCHEMA_FIELD_NOT_EXIST;
-  }
-
-  return RC::SUCCESS;
-}
-
 RC FilterStmt::create_filter_unit(Db *db, Table *default_table, unordered_map<string, Table *> *tables,
-    const ConditionSqlNode &condition, FilterUnit *&filter_unit)
+    const ConditionSqlNode &condition, ExpressionBinder &expression_binder, FilterUnit *&filter_unit)
 {
   RC rc = RC::SUCCESS;
+
+  (void)db;
+  (void)default_table;
+  (void)tables;
 
   CompOp comp = condition.comp;
   if (comp < EQUAL_TO || comp >= NO_OP) {
@@ -90,42 +94,23 @@ RC FilterStmt::create_filter_unit(Db *db, Table *default_table, unordered_map<st
   }
 
   filter_unit = new FilterUnit;
+  unique_ptr<ComparisonExpr> comparison_expr(
+      new ComparisonExpr(condition.comp, condition.left->copy(), condition.right->copy()));
 
-  if (condition.left_is_attr) {
-    Table           *table = nullptr;
-    const FieldMeta *field = nullptr;
-    rc                     = get_table_and_field(db, default_table, tables, condition.left_attr, table, field);
-    if (rc != RC::SUCCESS) {
-      LOG_WARN("cannot find attr");
-      return rc;
-    }
-    FilterObj filter_obj;
-    filter_obj.init_attr(Field(table, field));
-    filter_unit->set_left(filter_obj);
-  } else {
-    FilterObj filter_obj;
-    filter_obj.init_value(condition.left_value);
-    filter_unit->set_left(filter_obj);
+  vector<unique_ptr<Expression>> bound_expressions;
+  unique_ptr<Expression>         comparison_base(comparison_expr.release());
+  rc = expression_binder.bind_expression(comparison_base, bound_expressions);
+  if (rc != RC::SUCCESS) {
+    return rc;
   }
 
-  if (condition.right_is_attr) {
-    Table           *table = nullptr;
-    const FieldMeta *field = nullptr;
-    rc                     = get_table_and_field(db, default_table, tables, condition.right_attr, table, field);
-    if (rc != RC::SUCCESS) {
-      LOG_WARN("cannot find attr");
-      return rc;
-    }
-    FilterObj filter_obj;
-    filter_obj.init_attr(Field(table, field));
-    filter_unit->set_right(filter_obj);
-  } else {
-    FilterObj filter_obj;
-    filter_obj.init_value(condition.right_value);
-    filter_unit->set_right(filter_obj);
+  if (bound_expressions.size() != 1) {
+    LOG_WARN("invalid comparison expression binding result size: %zu", bound_expressions.size());
+    return RC::INVALID_ARGUMENT;
   }
 
-  filter_unit->set_comp(comp);
+  comparison_expr.reset(static_cast<ComparisonExpr *>(bound_expressions[0].release()));
+  filter_unit->set_comparison(std::move(comparison_expr));
 
   // 检查两个类型是否能够比较
   return rc;
